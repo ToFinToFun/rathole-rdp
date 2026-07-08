@@ -1,0 +1,6 @@
+# Never commit actual slots with tokens
+slots.txt
+
+# OS files
+.DS_Store
+Thumbs.db

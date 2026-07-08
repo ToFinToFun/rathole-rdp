@@ -1,0 +1,12 @@
+# Rathole RDP - Slot Configuration
+# Format: name|port|token|address|server
+#
+# name    : Unique identifier for this slot
+# port    : Remote port on VPS (3389 = default RDP, no port needed in client)
+# token   : Shared secret (generate with: openssl rand -hex 32)
+# address : DNS name or IP for display (what you type in mstsc.exe)
+# server  : VPS IP or hostname where rathole server runs
+#
+# Example:
+# mypc|3389|a1b2c3d4e5f6...|mypc.example.com|203.0.113.1
+# office|3390|f6e5d4c3b2a1...|office.example.com|203.0.113.1
