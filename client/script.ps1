@@ -90,17 +90,23 @@ function Read-SlotsFile {
     if (-not (Test-Path $SLOTS_FILE)) { return @() }
     
     $slots = @()
+    $publicKey = ""
     Get-Content $SLOTS_FILE | ForEach-Object {
         $line = $_.Trim()
+        # Parse public key from comment line
+        if ($line -match "^#.*public key.*:\s*(.+)$") {
+            $publicKey = $Matches[1].Trim()
+        }
         if ($line -and -not $line.StartsWith("#")) {
             $parts = $line.Split("|")
             if ($parts.Count -ge 4) {
                 $slots += @{
-                    Name    = $parts[0].Trim()
-                    Port    = [int]$parts[1].Trim()
-                    Token   = $parts[2].Trim()
-                    Address = $parts[3].Trim()
-                    Server  = if ($parts.Count -ge 5) { $parts[4].Trim() } else { "" }
+                    Name      = $parts[0].Trim()
+                    Port      = [int]$parts[1].Trim()
+                    Token     = $parts[2].Trim()
+                    Address   = $parts[3].Trim()
+                    Server    = if ($parts.Count -ge 5) { $parts[4].Trim() } else { "" }
+                    PublicKey = $publicKey
                 }
             }
         }
@@ -139,14 +145,16 @@ function Select-Slot {
         $server = Read-Host "  Server address (IP or hostname)"
         $port = Read-Host "  Remote port (e.g., 3389)"
         $token = Read-Host "  Token (from server setup)"
+        $pubKey = Read-Host "  Server public key (base64, from server setup)"
         $name = Read-Host "  Slot name (e.g., my-pc)"
         
         return @{
-            Name    = $name
-            Port    = [int]$port
-            Token   = $token
-            Address = "$name"
-            Server  = $server
+            Name      = $name
+            Port      = [int]$port
+            Token     = $token
+            Address   = "$name"
+            Server    = $server
+            PublicKey = $pubKey
         }
     }
     
@@ -252,6 +260,9 @@ remote_addr = "$serverAddr"
 
 [client.transport]
 type = "noise"
+
+[client.transport.noise]
+remote_public_key = "$($Slot.PublicKey)"
 
 [client.services.$($Slot.Name)]
 token = "$($Slot.Token)"
