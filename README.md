@@ -152,6 +152,12 @@ With strong passwords + rate limiting + NLA, it's reasonably safe. For maximum s
 **Q: Can multiple PCs share one VPS?**
 Yes! Each PC gets its own port and token. One rathole server handles all of them.
 
+**Q: What happens if I install the same slot on two PCs?**
+They will fight over the connection — both try to reconnect every 5 seconds, causing a disconnect loop. Neither will work reliably. **Each slot must only be active on ONE PC at a time.** If you turn off one PC, the other takes over within 5 seconds and works fine. But two PCs running simultaneously on the same slot = chaos.
+
+**Q: Can I move a slot between PCs?**
+Yes! Just uninstall on the old PC (or stop the service), and the new PC takes over automatically. You can also just stop the service on one and start on the other — no reinstall needed.
+
 ## Credits
 
 - [rathole](https://github.com/rapiz1/rathole) — The excellent Rust-based reverse proxy
