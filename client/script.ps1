@@ -183,15 +183,11 @@ function Enable-RemoteDesktop {
     try {
         Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
         
-        # Enable firewall rules for RDP (language-independent)
+        # Enable firewall rules for RDP (language-independent using resource string GUID)
         try {
             $rules = Get-NetFirewallRule -Group "@FirewallAPI.dll,-28752" -ErrorAction SilentlyContinue
             if ($rules) {
                 $rules | Enable-NetFirewallRule
-            } else {
-                # Fallback: enable by display group name
-                Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-                Enable-NetFirewallRule -DisplayGroup "Fjärrskrivbord" -ErrorAction SilentlyContinue
             }
         } catch {
             # Non-critical - tunnel bypasses local firewall anyway
@@ -340,11 +336,6 @@ function Install-Service {
   <onfailure action="restart" delay="10 sec"/>
   <onfailure action="restart" delay="30 sec"/>
   <resetfailure>1 hour</resetfailure>
-  <serviceaccount>
-    <domain>NT AUTHORITY</domain>
-    <user>LocalSystem</user>
-    <allowservicelogon>true</allowservicelogon>
-  </serviceaccount>
 </service>
 "@
         
@@ -526,19 +517,20 @@ function Get-CurrentPowerState {
     $state = @{}
     
     try {
-        # Check sleep settings
-        $acSleep = powercfg /q SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 2>$null | Select-String "Current AC" | ForEach-Object { ($_ -split ":\s*")[1] -replace "0x", "" }
-        $dcSleep = powercfg /q SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 2>$null | Select-String "Current DC" | ForEach-Object { ($_ -split ":\s*")[1] -replace "0x", "" }
-        $state.SleepAC = if ($acSleep) { [convert]::ToInt32($acSleep, 16) -eq 0 } else { $false }
-        $state.SleepDC = if ($dcSleep) { [convert]::ToInt32($dcSleep, 16) -eq 0 } else { $false }
+        # Check sleep settings (locale-independent: parse hex values by position)
+        $sleepOut = powercfg /q SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 2>$null
+        $hexValues = @($sleepOut | Select-String '0x([0-9a-fA-F]+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
+        # Output order: min, max, increment, AC, DC (AC = index -2, DC = index -1)
+        $state.SleepAC = if ($hexValues.Count -ge 2) { [convert]::ToInt32($hexValues[$hexValues.Count - 2], 16) -eq 0 } else { $false }
+        $state.SleepDC = if ($hexValues.Count -ge 1) { [convert]::ToInt32($hexValues[$hexValues.Count - 1], 16) -eq 0 } else { $false }
     } catch { $state.SleepAC = $false; $state.SleepDC = $false }
     
     try {
-        # Check lid action
-        $acLid = powercfg /q SCHEME_CURRENT SUB_BUTTONS LIDACTION 2>$null | Select-String "Current AC" | ForEach-Object { ($_ -split ":\s*")[1] -replace "0x", "" }
-        $dcLid = powercfg /q SCHEME_CURRENT SUB_BUTTONS LIDACTION 2>$null | Select-String "Current DC" | ForEach-Object { ($_ -split ":\s*")[1] -replace "0x", "" }
-        $state.LidAC = if ($acLid) { [convert]::ToInt32($acLid, 16) -eq 0 } else { $false }
-        $state.LidDC = if ($dcLid) { [convert]::ToInt32($dcLid, 16) -eq 0 } else { $false }
+        # Check lid action (locale-independent: parse hex values by position)
+        $lidOut = powercfg /q SCHEME_CURRENT SUB_BUTTONS LIDACTION 2>$null
+        $hexValues = @($lidOut | Select-String '0x([0-9a-fA-F]+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
+        $state.LidAC = if ($hexValues.Count -ge 2) { [convert]::ToInt32($hexValues[$hexValues.Count - 2], 16) -eq 0 } else { $false }
+        $state.LidDC = if ($hexValues.Count -ge 1) { [convert]::ToInt32($hexValues[$hexValues.Count - 1], 16) -eq 0 } else { $false }
     } catch { $state.LidAC = $false; $state.LidDC = $false }
     
     try {
@@ -559,9 +551,11 @@ function Get-CurrentPowerState {
     } catch { $state.NICPowerOff = $false }
     
     try {
-        # Check connectivity in standby
-        $cs = powercfg /q SCHEME_CURRENT SUB_NONE CONNECTIVITYINSTANDBY 2>$null | Select-String "Current AC" | ForEach-Object { ($_ -split ":\s*")[1] -replace "0x", "" }
-        $state.NetworkStandby = if ($cs) { [convert]::ToInt32($cs, 16) -eq 1 } else { $false }
+        # Check connectivity in standby (locale-independent: parse hex values by position)
+        $csOut = powercfg /q SCHEME_CURRENT SUB_NONE CONNECTIVITYINSTANDBY 2>$null
+        $hexValues = @($csOut | Select-String '0x([0-9a-fA-F]+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
+        # AC value is second-to-last hex in output
+        $state.NetworkStandby = if ($hexValues.Count -ge 2) { [convert]::ToInt32($hexValues[$hexValues.Count - 2], 16) -eq 1 } else { $false }
     } catch { $state.NetworkStandby = $false }
     
     try {
