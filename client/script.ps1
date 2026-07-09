@@ -62,6 +62,227 @@ function Test-RDPCapable {
     return $true
 }
 
+# --- Azure AD / Entra ID Functions ---
+function Test-AzureADJoined {
+    $result = @{
+        IsAzureADJoined = $false
+        IsHybridJoined  = $false
+        JoinType        = "None"
+        TenantName      = ""
+        UserName        = ""
+    }
+    
+    try {
+        $dsreg = dsregcmd /status 2>$null
+        if ($dsreg) {
+            $azureAdJoined = ($dsreg | Select-String "AzureAdJoined\s*:\s*YES") -ne $null
+            $domainJoined = ($dsreg | Select-String "DomainJoined\s*:\s*YES") -ne $null
+            $tenantLine = $dsreg | Select-String "TenantName\s*:\s*(.+)"
+            
+            if ($azureAdJoined) {
+                $result.IsAzureADJoined = $true
+                if ($domainJoined) {
+                    $result.IsHybridJoined = $true
+                    $result.JoinType = "Hybrid Azure AD Joined"
+                } else {
+                    $result.JoinType = "Azure AD Joined (pure)"
+                }
+            }
+            
+            if ($tenantLine) {
+                $result.TenantName = ($tenantLine -replace ".*:\s*", "").Trim()
+            }
+        }
+    }
+    catch { }
+    
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $result.UserName = $currentUser
+    
+    return $result
+}
+
+function Test-PKU2UEnabled {
+    $pku2u = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\Pku2u" -Name "AllowOnlineID" -ErrorAction SilentlyContinue
+    return ($pku2u -and $pku2u.AllowOnlineID -eq 1)
+}
+
+function Show-AzureADDiagnostics {
+    param([hashtable]$AzureInfo)
+    $ErrorActionPreference = "Continue"
+    
+    Write-Host ""
+    Write-Host "===========================================================" -ForegroundColor Yellow
+    Write-Host "  AZURE AD / ENTRA ID DETECTED" -ForegroundColor Yellow
+    Write-Host "===========================================================" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  Join type:    $($AzureInfo.JoinType)" -ForegroundColor White
+    if ($AzureInfo.TenantName) {
+        Write-Host "  Tenant:       $($AzureInfo.TenantName)" -ForegroundColor White
+    }
+    Write-Host "  Current user: $($AzureInfo.UserName)" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  Azure AD devices need PKU2U enabled and the user must be" -ForegroundColor White
+    Write-Host "  in the Remote Desktop Users group for native RDP to work." -ForegroundColor White
+    Write-Host ""
+    Write-Host "-----------------------------------------------------------" -ForegroundColor DarkGray
+    
+    $issuesFound = 0
+    $issuesFixed = 0
+    
+    # CHECK 1: PKU2U Protocol
+    Write-Host ""
+    Write-Host "  CHECK 1: PKU2U Protocol (Azure AD authentication)" -ForegroundColor Cyan
+    Write-Host ""
+    
+    if (-not (Test-PKU2UEnabled)) {
+        $issuesFound++
+        Write-Host "  STATUS: PKU2U is DISABLED" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  PROBLEM:" -ForegroundColor Yellow
+        Write-Host "  PKU2U is the protocol Windows uses to authenticate Azure AD"
+        Write-Host "  users for RDP connections. Without it, login will fail."
+        Write-Host ""
+        Write-Host "  FIX: Enable PKU2U protocol" -ForegroundColor Yellow
+        Write-Host "  Registry: HKLM\SYSTEM\...\Lsa\Pku2u\AllowOnlineID = 1" -ForegroundColor Gray
+        Write-Host "  RISK: VERY LOW - Microsoft's recommended setting." -ForegroundColor White
+        Write-Host ""
+        
+        $fix = Read-Host "  Apply fix? Enable PKU2U [Y/N]"
+        if ($fix -match '^[yY]') {
+            try {
+                $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\Pku2u"
+                if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+                Set-ItemProperty -Path $regPath -Name "AllowOnlineID" -Value 1 -Type DWord -Force
+                Write-Host "  [OK] PKU2U enabled." -ForegroundColor Green
+                $issuesFixed++
+            }
+            catch { Write-Host "  [X] Failed: $_" -ForegroundColor Red }
+        }
+        else {
+            Write-Host "  [--] Skipped. Azure AD login may not work." -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "  STATUS: PKU2U already ENABLED (good)" -ForegroundColor Green
+    }
+    
+    # CHECK 2: Remote Desktop Users group
+    Write-Host ""
+    Write-Host "  CHECK 2: Remote Desktop Users group" -ForegroundColor Cyan
+    Write-Host ""
+    
+    $rdpGroupSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-555")
+    $rdpGroupName = $rdpGroupSID.Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
+    $authUsersSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-11")
+    $authUsersName = $authUsersSID.Translate([System.Security.Principal.NTAccount]).Value
+    $authUsersShort = $authUsersName.Split('\')[-1]
+    
+    Write-Host "  Group: $rdpGroupName" -ForegroundColor Gray
+    
+    $rdpGroup = net localgroup "$rdpGroupName" 2>$null
+    $hasAuthUsers = $rdpGroup | Select-String ([regex]::Escape($authUsersShort))
+    
+    if (-not $hasAuthUsers) {
+        $issuesFound++
+        Write-Host "  STATUS: '$authUsersShort' NOT in $rdpGroupName" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  FIX: Add '$authUsersShort' to $rdpGroupName" -ForegroundColor Yellow
+        Write-Host "  RISK: LOW - Password still required for RDP access." -ForegroundColor White
+        Write-Host ""
+        
+        $fix = Read-Host "  Apply fix? [Y/N]"
+        if ($fix -match '^[yY]') {
+            try {
+                $group = [ADSI]"WinNT://./$rdpGroupName,group"
+                $group.Add("WinNT://S-1-5-11")
+                Write-Host "  [OK] '$authUsersShort' added to $rdpGroupName." -ForegroundColor Green
+                $issuesFixed++
+            }
+            catch {
+                $netResult = net localgroup "$rdpGroupName" "$authUsersShort" /add 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "  [OK] '$authUsersShort' added to $rdpGroupName." -ForegroundColor Green
+                    $issuesFixed++
+                }
+                else {
+                    Write-Host "  [X] Failed: $netResult" -ForegroundColor Red
+                }
+            }
+        }
+        else {
+            Write-Host "  [--] Skipped." -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "  STATUS: '$authUsersShort' is in the group (good)" -ForegroundColor Green
+    }
+    
+    # CHECK 3: CredSSP (optional)
+    Write-Host ""
+    Write-Host "  CHECK 3: CredSSP Encryption Oracle (optional)" -ForegroundColor Cyan
+    Write-Host ""
+    
+    $credSSPPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters"
+    $credSSP = Get-ItemProperty -Path $credSSPPath -Name "AllowEncryptionOracle" -ErrorAction SilentlyContinue
+    
+    if (-not $credSSP -or $credSSP.AllowEncryptionOracle -ne 2) {
+        $issuesFound++
+        Write-Host "  STATUS: CredSSP not set to fallback mode" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  NOTE: This fix is OPTIONAL. Try without it first." -ForegroundColor Gray
+        Write-Host "  Only apply if RDP still fails after fixes 1-2." -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  FIX: Set CredSSP AllowEncryptionOracle = 2" -ForegroundColor Yellow
+        Write-Host "  RISK: MEDIUM-LOW - Allows older CredSSP as fallback." -ForegroundColor White
+        Write-Host "  Connection goes through encrypted tunnel anyway." -ForegroundColor White
+        Write-Host ""
+        
+        $fix = Read-Host "  Apply fix? [Y/N]"
+        if ($fix -match '^[yY]') {
+            try {
+                $parentPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP"
+                if (-not (Test-Path $parentPath)) { New-Item -Path $parentPath -Force | Out-Null }
+                if (-not (Test-Path $credSSPPath)) { New-Item -Path $credSSPPath -Force | Out-Null }
+                Set-ItemProperty -Path $credSSPPath -Name "AllowEncryptionOracle" -Value 2 -Type DWord -Force
+                Write-Host "  [OK] CredSSP set to fallback mode." -ForegroundColor Green
+                $issuesFixed++
+            }
+            catch { Write-Host "  [X] Failed: $_" -ForegroundColor Red }
+        }
+        else {
+            Write-Host "  [--] Skipped (recommended to try without)." -ForegroundColor Gray
+        }
+    }
+    else {
+        Write-Host "  STATUS: CredSSP already configured (good)" -ForegroundColor Green
+    }
+    
+    # SUMMARY
+    Write-Host ""
+    Write-Host "-----------------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host ""
+    
+    if ($issuesFound -eq 0) {
+        Write-Host "  All Azure AD checks passed!" -ForegroundColor Green
+    }
+    elseif ($issuesFixed -eq $issuesFound) {
+        Write-Host "  All $issuesFound issue(s) fixed!" -ForegroundColor Green
+    }
+    elseif ($issuesFixed -gt 0) {
+        Write-Host "  Fixed $issuesFixed of $issuesFound issue(s)." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "  $issuesFound issue(s) found but none fixed." -ForegroundColor Red
+    }
+    
+    Write-Host ""
+    Write-Host "  LOGIN TIP FOR AZURE AD:" -ForegroundColor Cyan
+    Write-Host "  Username: AzureAD\YourName  (run 'whoami' to check)" -ForegroundColor White
+    Write-Host "  Password: Microsoft account password (NOT PIN)" -ForegroundColor White
+    Write-Host ""
+}
+
 function Get-ExistingInstall {
     if (Test-Path $MARKER_FILE) {
         return Get-Content $MARKER_FILE | ConvertFrom-Json
@@ -430,17 +651,19 @@ function Show-ManageMenu {
     Write-Host "  [U] Uninstall (remove everything)" -ForegroundColor Yellow
     Write-Host "  [S] Status (check service and connectivity)" -ForegroundColor Yellow
     Write-Host "  [L] Logs (view recent log entries)" -ForegroundColor Yellow
+    Write-Host "  [D] Diagnostics (Azure AD / login issues)" -ForegroundColor Yellow
     Write-Host "  [P] Power management settings" -ForegroundColor Yellow
     Write-Host "  [Q] Quit" -ForegroundColor Yellow
     Write-Host ""
     
-    $choice = Read-Host "  Choose [R/U/S/L/P/Q]"
+    $choice = Read-Host "  Choose [R/U/S/L/D/P/Q]"
     
     switch ($choice.ToUpper()) {
         "R" { return "reinstall" }
         "U" { return "uninstall" }
         "S" { return "status" }
         "L" { return "logs" }
+        "D" { return "diagnostics" }
         "P" { return "power" }
         "Q" { exit 0 }
         default { return "quit" }
@@ -787,6 +1010,23 @@ if ($existing) {
         "uninstall" { Invoke-Uninstall }
         "status" { Show-Status; exit 0 }
         "logs" { Show-Logs; exit 0 }
+        "diagnostics" {
+            $azureInfo = Test-AzureADJoined
+            if ($azureInfo.IsAzureADJoined) {
+                Show-AzureADDiagnostics -AzureInfo $azureInfo
+            } else {
+                Write-Host ""
+                Write-Host "  This PC is NOT Azure AD joined." -ForegroundColor Green
+                Write-Host "  Azure AD fixes are not needed." -ForegroundColor Green
+                Write-Host ""
+                Write-Host "  If RDP login still doesn't work, check:" -ForegroundColor White
+                Write-Host "  - Username: Your Windows username (not PIN)" -ForegroundColor White
+                Write-Host "  - Password: Your Windows password (not PIN)" -ForegroundColor White
+                Write-Host ""
+            }
+            Read-Host "  Press Enter to continue"
+            exit 0
+        }
         "power" { Show-PowerManagement; exit 0 }
         "reinstall" { 
             Write-Host "  Removing existing installation first..." -ForegroundColor Yellow
@@ -816,6 +1056,18 @@ Write-Host ""
 $results = @{}
 
 $results["Remote Desktop"] = Enable-RemoteDesktop
+
+# Azure AD check (runs automatically during install)
+Write-Host ""
+Write-Host "[Azure AD] Checking device join status..." -ForegroundColor Cyan
+$azureInfo = Test-AzureADJoined
+
+if ($azureInfo.IsAzureADJoined) {
+    Show-AzureADDiagnostics -AzureInfo $azureInfo
+} else {
+    Write-Host "  [i] Not Azure AD joined - no special fixes needed." -ForegroundColor Gray
+}
+
 $results["Download"] = Install-Rathole -Slot $slot
 $results["Configuration"] = New-RatholeConfig -Slot $slot
 $results["Service Install"] = Install-Service
@@ -858,6 +1110,15 @@ if ($failures -eq 0) {
     Write-Host ""
     Write-Host "  The tunnel reconnects automatically if the network changes." -ForegroundColor DarkGray
     Write-Host ""
+    
+    # Azure AD login hint
+    if ($azureInfo.IsAzureADJoined) {
+        Write-Host "  AZURE AD LOGIN:" -ForegroundColor Cyan
+        $shortName = $azureInfo.UserName.Split('\')[-1]
+        Write-Host "  Username: AzureAD\$shortName" -ForegroundColor White
+        Write-Host "  Password: Your Microsoft account password (NOT PIN)" -ForegroundColor White
+        Write-Host ""
+    }
     
     # Offer power management
     Write-Host "-----------------------------------------------------------"
