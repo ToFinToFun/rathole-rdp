@@ -598,42 +598,37 @@ function Show-PowerManagement {
     # Get current state
     $state = Get-CurrentPowerState
     
-    # Display matrix
-    $fmt = "  {0,-30} {1,-9} {2,-6} {3,-10} {4,-6} {5,-4}"
-    Write-Host ($fmt -f "Setting", "Current", "Low+", "Balanced", "High", "MAX") -ForegroundColor White
+    # Display matrix - each row is a separate array to prevent PowerShell flattening
+    $header = "  {0,-28} {1,-9} {2,-6} {3,-10} {4,-6} {5,-4}" -f "Setting", "Current", "Low+", "Balanced", "High", "MAX"
+    Write-Host $header -ForegroundColor White
     Write-Host "  $('-' * 67)"
     
-    $rows = @(
-        @("NIC power saving off",       $state.NICPowerOff,     $true,  $true,  $true,  $true)
-        @("Network alive in standby",   $state.NetworkStandby,  $true,  $true,  $true,  $true)
-        @("Sleep disabled (AC)",        $state.SleepAC,         $false, $true,  $true,  $true)
-        @("Sleep disabled (battery)",   $state.SleepDC,         $false, $false, $true,  $true)
-        @("Lid close = do nothing (AC)",$state.LidAC,           $false, $true,  $true,  $true)
-        @("Lid close = do nothing (bat)",$state.LidDC,          $false, $false, $true,  $true)
-        @("Hibernate disabled",         $state.HibernateOff,    $false, $true,  $true,  $true)
-        @("Shutdown button hidden",     $state.ShutdownHidden,  $false, $false, $false, $true)
-    )
-    
-    foreach ($row in $rows) {
-        $name = $row[0]
-        $current = if ($row[1]) { "YES" } else { "no" }
-        $currentColor = if ($row[1]) { "Green" } else { "Red" }
-        
-        $cols = @()
-        for ($i = 2; $i -le 5; $i++) {
-            if ($row[$i] -eq $true) { $cols += [char]0x2713 }
-            else { $cols += "-" }
-        }
-        
-        $line = "  {0,-30} " -f $name
-        Write-Host $line -NoNewline
+    # Helper function to print one row (avoids array flattening)
+    function Write-PowerRow {
+        param([string]$Name, [bool]$Value, [bool]$InLow, [bool]$InBal, [bool]$InHigh, [bool]$InMax)
+        $current = if ($Value) { "YES" } else { "no" }
+        $currentColor = if ($Value) { "Green" } else { "Red" }
+        $c1 = if ($InLow)  { "X" } else { "-" }
+        $c2 = if ($InBal)  { "X" } else { "-" }
+        $c3 = if ($InHigh) { "X" } else { "-" }
+        $c4 = if ($InMax)  { "X" } else { "-" }
+        Write-Host ("  {0,-28} " -f $Name) -NoNewline
         Write-Host ("{0,-9}" -f $current) -ForegroundColor $currentColor -NoNewline
-        Write-Host (" {0,-6} {1,-10} {2,-6} {3,-4}" -f $cols[0], $cols[1], $cols[2], $cols[3])
+        Write-Host (" {0,-6} {1,-10} {2,-6} {3,-4}" -f $c1, $c2, $c3, $c4)
     }
+    
+    Write-PowerRow "NIC power saving off"        ([bool]$state.NICPowerOff)    $true  $true  $true  $true
+    Write-PowerRow "Network alive in standby"    ([bool]$state.NetworkStandby) $true  $true  $true  $true
+    Write-PowerRow "Sleep disabled (AC)"         ([bool]$state.SleepAC)        $false $true  $true  $true
+    Write-PowerRow "Sleep disabled (battery)"    ([bool]$state.SleepDC)        $false $false $true  $true
+    Write-PowerRow "Lid close = nothing (AC)"    ([bool]$state.LidAC)          $false $true  $true  $true
+    Write-PowerRow "Lid close = nothing (bat)"   ([bool]$state.LidDC)          $false $false $true  $true
+    Write-PowerRow "Hibernate disabled"          ([bool]$state.HibernateOff)   $false $true  $true  $true
+    Write-PowerRow "Shutdown button hidden"      ([bool]$state.ShutdownHidden) $false $false $false $true
     
     Write-Host "  $('-' * 67)"
     Write-Host ""
-    Write-Host '  [checkmark] = active/will be set   "-" = not changed by preset' -ForegroundColor DarkGray
+    Write-Host '  X = included in preset   "-" = not changed by preset' -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  RISKS:" -ForegroundColor Yellow
     Write-Host "    Low+     : Minimal. Only keeps network alive."
