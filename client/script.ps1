@@ -102,6 +102,11 @@ function Test-AzureADJoined {
     return $result
 }
 
+function Test-NLAEnabled {
+    $nla = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -ErrorAction SilentlyContinue
+    return ($nla -and $nla.UserAuthentication -eq 1)
+}
+
 function Test-PKU2UEnabled {
     $pku2u = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\Pku2u" -Name "AllowOnlineID" -ErrorAction SilentlyContinue
     return ($pku2u -and $pku2u.AllowOnlineID -eq 1)
@@ -122,17 +127,62 @@ function Show-AzureADDiagnostics {
     }
     Write-Host "  Current user: $($AzureInfo.UserName)" -ForegroundColor White
     Write-Host ""
-    Write-Host "  Azure AD devices need PKU2U enabled and the user must be" -ForegroundColor White
-    Write-Host "  in the Remote Desktop Users group for native RDP to work." -ForegroundColor White
+    Write-Host "  Azure AD devices have known issues with RDP when connecting" -ForegroundColor White
+    Write-Host "  from a device that is NOT in the same Azure AD tenant." -ForegroundColor White
+    Write-Host "  The script will check and fix common issues." -ForegroundColor White
+    Write-Host ""
+    Write-Host "  You will be asked before ANY change is made." -ForegroundColor White
     Write-Host ""
     Write-Host "-----------------------------------------------------------" -ForegroundColor DarkGray
     
     $issuesFound = 0
     $issuesFixed = 0
     
-    # CHECK 1: PKU2U Protocol
+    # CHECK 1: NLA (Network Level Authentication)
     Write-Host ""
-    Write-Host "  CHECK 1: PKU2U Protocol (Azure AD authentication)" -ForegroundColor Cyan
+    Write-Host "  CHECK 1: Network Level Authentication (NLA)" -ForegroundColor Cyan
+    Write-Host ""
+    
+    if (Test-NLAEnabled) {
+        $issuesFound++
+        Write-Host "  STATUS: NLA is ENABLED (blocks Azure AD login from external devices)" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  PROBLEM:" -ForegroundColor Yellow
+        Write-Host "  NLA requires the connecting client to authenticate BEFORE"
+        Write-Host "  the RDP session starts. When connecting from a device that"
+        Write-Host "  is NOT joined to the same Azure AD tenant, NLA cannot"
+        Write-Host "  verify the credentials and the connection is rejected."
+        Write-Host ""
+        Write-Host "  FIX: Disable NLA (Network Level Authentication)" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  WHAT THIS CHANGES:" -ForegroundColor White
+        Write-Host "  - Registry: HKLM\...\RDP-Tcp\UserAuthentication = 0"
+        Write-Host "  - RDP clients authenticate AFTER connecting"
+        Write-Host ""
+        Write-Host "  RISK: LOW - RDP port is NOT exposed to internet." -ForegroundColor White
+        Write-Host "  Access is only possible through the encrypted tunnel." -ForegroundColor White
+        Write-Host ""
+        
+        $fix = Read-Host "  Apply fix? Disable NLA [Y/N]"
+        if ($fix -match '^[yY]') {
+            try {
+                Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0 -Force
+                Write-Host "  [OK] NLA disabled." -ForegroundColor Green
+                $issuesFixed++
+            }
+            catch { Write-Host "  [X] Failed: $_" -ForegroundColor Red }
+        }
+        else {
+            Write-Host "  [--] Skipped. RDP login will likely NOT work from external devices." -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "  STATUS: NLA already DISABLED (good)" -ForegroundColor Green
+    }
+    
+    # CHECK 2: PKU2U Protocol
+    Write-Host ""
+    Write-Host "  CHECK 2: PKU2U Protocol (Azure AD authentication)" -ForegroundColor Cyan
     Write-Host ""
     
     if (-not (Test-PKU2UEnabled)) {
@@ -167,9 +217,9 @@ function Show-AzureADDiagnostics {
         Write-Host "  STATUS: PKU2U already ENABLED (good)" -ForegroundColor Green
     }
     
-    # CHECK 2: Remote Desktop Users group
+    # CHECK 3: Remote Desktop Users group
     Write-Host ""
-    Write-Host "  CHECK 2: Remote Desktop Users group" -ForegroundColor Cyan
+    Write-Host "  CHECK 3: Remote Desktop Users group" -ForegroundColor Cyan
     Write-Host ""
     
     $rdpGroupSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-555")
@@ -218,9 +268,9 @@ function Show-AzureADDiagnostics {
         Write-Host "  STATUS: '$authUsersShort' is in the group (good)" -ForegroundColor Green
     }
     
-    # CHECK 3: CredSSP (optional)
+    # CHECK 4: CredSSP (optional)
     Write-Host ""
-    Write-Host "  CHECK 3: CredSSP Encryption Oracle (optional)" -ForegroundColor Cyan
+    Write-Host "  CHECK 4: CredSSP Encryption Oracle (optional)" -ForegroundColor Cyan
     Write-Host ""
     
     $credSSPPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters"
@@ -231,7 +281,7 @@ function Show-AzureADDiagnostics {
         Write-Host "  STATUS: CredSSP not set to fallback mode" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "  NOTE: This fix is OPTIONAL. Try without it first." -ForegroundColor Gray
-        Write-Host "  Only apply if RDP still fails after fixes 1-2." -ForegroundColor Gray
+        Write-Host "  Only apply if RDP still fails after fixes 1-3." -ForegroundColor Gray
         Write-Host ""
         Write-Host "  FIX: Set CredSSP AllowEncryptionOracle = 2" -ForegroundColor Yellow
         Write-Host "  RISK: MEDIUM-LOW - Allows older CredSSP as fallback." -ForegroundColor White
