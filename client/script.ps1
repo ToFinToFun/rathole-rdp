@@ -211,9 +211,10 @@ function Install-Rathole {
     Write-Host "[2/5] Downloading rathole v${RATHOLE_VERSION}..." -ForegroundColor Cyan
     
     try {
-        # Determine architecture
-        $arch = if ([Environment]::Is64BitOperatingSystem) { "x86_64-pc-windows-msvc" } else { "i686-pc-windows-msvc" }
-        $url = "https://github.com/rapiz1/rathole/releases/download/v${RATHOLE_VERSION}/rathole-${arch}.zip"
+        # Download from our custom-compiled release (avoids Windows Defender false positives)
+        # The official rathole binary triggers Trojan:Win32/Vigorf.A due to self-extracting format
+        # Our build is compiled from source with Rust 1.72.0, target: x86_64-pc-windows-gnu
+        $url = "https://github.com/ToFinToFun/rathole-rdp/releases/download/v${RATHOLE_VERSION}-custom/rathole-windows-x86_64.zip"
         
         # Create install directory
         if (-not (Test-Path $INSTALL_DIR)) {
