@@ -220,6 +220,17 @@ function Install-Rathole {
             New-Item -ItemType Directory -Path $INSTALL_DIR -Force | Out-Null
         }
         
+        # Add Windows Defender exclusion for install directory and temp
+        # Rathole is a legitimate tunnel binary but Defender flags tunnel tools as PUA
+        try {
+            Add-MpPreference -ExclusionPath $INSTALL_DIR -ErrorAction SilentlyContinue
+            Add-MpPreference -ExclusionPath "$env:TEMP\rathole.zip" -ErrorAction SilentlyContinue
+            Add-MpPreference -ExclusionPath "$env:TEMP\rathole" -ErrorAction SilentlyContinue
+            Write-Host "  [i] Defender exclusion added for install directory." -ForegroundColor DarkGray
+        } catch {
+            Write-Host "  [!] Could not add Defender exclusion (non-critical)." -ForegroundColor DarkYellow
+        }
+        
         # Download
         $zipPath = "$env:TEMP\rathole.zip"
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -229,15 +240,23 @@ function Install-Rathole {
         Expand-Archive -Path $zipPath -DestinationPath "$env:TEMP\rathole" -Force
         Copy-Item "$env:TEMP\rathole\rathole.exe" "$INSTALL_DIR\rathole.exe" -Force
         
-        # Cleanup
+        # Cleanup temp files
         Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
         Remove-Item "$env:TEMP\rathole" -Recurse -Force -ErrorAction SilentlyContinue
+        # Remove temp exclusions (keep install dir exclusion)
+        try {
+            Remove-MpPreference -ExclusionPath "$env:TEMP\rathole.zip" -ErrorAction SilentlyContinue
+            Remove-MpPreference -ExclusionPath "$env:TEMP\rathole" -ErrorAction SilentlyContinue
+        } catch {}
         
         $size = [math]::Round((Get-Item "$INSTALL_DIR\rathole.exe").Length / 1MB, 1)
         Write-Host "  [OK] Rathole downloaded ($size MB)." -ForegroundColor Green
         return $true
     } catch {
         Write-Host "  [X] Download failed: $_" -ForegroundColor Red
+        Write-Host "  [!] If blocked by antivirus, manually add exclusion:" -ForegroundColor Yellow
+        Write-Host "      Windows Security > Virus protection > Exclusions" -ForegroundColor Yellow
+        Write-Host "      Add folder: $INSTALL_DIR" -ForegroundColor Yellow
         return $false
     }
 }
@@ -272,10 +291,13 @@ local_addr = "127.0.0.1:3389"
         Set-Content -Path $CONFIG_FILE -Value $config -Force
         
         # Restrict file permissions (only SYSTEM and Administrators)
+        # Use SIDs for language independence (works on Swedish, English, etc.)
         $acl = Get-Acl $CONFIG_FILE
         $acl.SetAccessRuleProtection($true, $false)
-        $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule("Administrators", "FullControl", "Allow")
-        $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule("SYSTEM", "FullControl", "Allow")
+        $adminSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")  # BUILTIN\Administrators
+        $systemSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")     # NT AUTHORITY\SYSTEM
+        $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminSID, "FullControl", "Allow")
+        $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule($systemSID, "FullControl", "Allow")
         $acl.AddAccessRule($adminRule)
         $acl.AddAccessRule($systemRule)
         Set-Acl $CONFIG_FILE $acl
