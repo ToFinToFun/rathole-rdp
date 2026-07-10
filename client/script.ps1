@@ -785,25 +785,65 @@ function Show-Logs {
 }
 
 # --- Power Management (integrated from Set-RdpAvailability) ---
+
+# Helper: Get the active power scheme GUID (locale-independent)
+function Get-ActiveSchemeGuid {
+    $out = powercfg /getactivescheme 2>$null
+    if ($out -match '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}') {
+        return $Matches[0]
+    }
+    return $null
+}
+
+# Helper: Read a specific power setting's AC and DC values using powercfg /q
+# Returns @{ AC = [int]; DC = [int] } or $null
+# powercfg /q output has lines with hex values. The LAST two 0x lines are always AC then DC.
+# But some settings only have AC (no DC). We parse all lines containing "0x" that are
+# indented (setting values), skipping GUID lines.
+function Get-PowerSettingValue {
+    param([string]$SubGroup, [string]$Setting)
+    try {
+        $guid = Get-ActiveSchemeGuid
+        if (-not $guid) { return $null }
+        $out = powercfg /q $guid $SubGroup $Setting 2>$null
+        if (-not $out) { return $null }
+        
+        # Find lines that contain "0x" but are NOT GUID lines (GUIDs have dashes)
+        # Setting value lines look like: "    Current AC Power Setting Index: 0x00000000"
+        # They always have leading whitespace and contain 0x followed by hex digits
+        $valueLines = @($out | Where-Object { $_ -match '^\s+.*0x([0-9a-fA-F]+)' -and $_ -notmatch '[0-9a-fA-F]{8}-' })
+        
+        $result = @{ AC = -1; DC = -1 }
+        if ($valueLines.Count -ge 2) {
+            # Last two value lines: AC then DC (powercfg always outputs AC before DC)
+            $valueLines[-2] -match '0x([0-9a-fA-F]+)' | Out-Null
+            $result.AC = [convert]::ToInt32($Matches[1], 16)
+            $valueLines[-1] -match '0x([0-9a-fA-F]+)' | Out-Null
+            $result.DC = [convert]::ToInt32($Matches[1], 16)
+        } elseif ($valueLines.Count -eq 1) {
+            $valueLines[0] -match '0x([0-9a-fA-F]+)' | Out-Null
+            $result.AC = [convert]::ToInt32($Matches[1], 16)
+        }
+        return $result
+    } catch { return $null }
+}
+
 function Get-CurrentPowerState {
     $ErrorActionPreference = "Continue"
     $state = @{}
     
     try {
-        # Check sleep settings (locale-independent: parse hex values by position)
-        $sleepOut = powercfg /q SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 2>$null
-        $hexValues = @($sleepOut | Select-String '0x([0-9a-fA-F]+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
-        # Output order: min, max, increment, AC, DC (AC = index -2, DC = index -1)
-        $state.SleepAC = if ($hexValues.Count -ge 2) { [convert]::ToInt32($hexValues[$hexValues.Count - 2], 16) -eq 0 } else { $false }
-        $state.SleepDC = if ($hexValues.Count -ge 1) { [convert]::ToInt32($hexValues[$hexValues.Count - 1], 16) -eq 0 } else { $false }
+        # Check sleep settings
+        $sleep = Get-PowerSettingValue "SUB_SLEEP" "STANDBYIDLE"
+        $state.SleepAC = if ($sleep -and $sleep.AC -eq 0) { $true } else { $false }
+        $state.SleepDC = if ($sleep -and $sleep.DC -eq 0) { $true } else { $false }
     } catch { $state.SleepAC = $false; $state.SleepDC = $false }
     
     try {
-        # Check lid action (locale-independent: parse hex values by position)
-        $lidOut = powercfg /q SCHEME_CURRENT SUB_BUTTONS LIDACTION 2>$null
-        $hexValues = @($lidOut | Select-String '0x([0-9a-fA-F]+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
-        $state.LidAC = if ($hexValues.Count -ge 2) { [convert]::ToInt32($hexValues[$hexValues.Count - 2], 16) -eq 0 } else { $false }
-        $state.LidDC = if ($hexValues.Count -ge 1) { [convert]::ToInt32($hexValues[$hexValues.Count - 1], 16) -eq 0 } else { $false }
+        # Check lid action (0 = do nothing, 1 = sleep, 2 = hibernate, 3 = shut down)
+        $lid = Get-PowerSettingValue "SUB_BUTTONS" "LIDACTION"
+        $state.LidAC = if ($lid -and $lid.AC -eq 0) { $true } else { $false }
+        $state.LidDC = if ($lid -and $lid.DC -eq 0) { $true } else { $false }
     } catch { $state.LidAC = $false; $state.LidDC = $false }
     
     try {
@@ -824,11 +864,9 @@ function Get-CurrentPowerState {
     } catch { $state.NICPowerOff = $false }
     
     try {
-        # Check connectivity in standby (locale-independent: parse hex values by position)
-        $csOut = powercfg /q SCHEME_CURRENT SUB_NONE CONNECTIVITYINSTANDBY 2>$null
-        $hexValues = @($csOut | Select-String '0x([0-9a-fA-F]+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
-        # AC value is second-to-last hex in output
-        $state.NetworkStandby = if ($hexValues.Count -ge 2) { [convert]::ToInt32($hexValues[$hexValues.Count - 2], 16) -eq 1 } else { $false }
+        # Check connectivity in standby (1 = enabled/managed, 0 = disabled)
+        $cs = Get-PowerSettingValue "SUB_NONE" "CONNECTIVITYINSTANDBY"
+        $state.NetworkStandby = if ($cs -and $cs.AC -ge 1) { $true } else { $false }
     } catch { $state.NetworkStandby = $false }
     
     try {
@@ -871,62 +909,61 @@ function Show-PowerManagement {
     # Get current state
     $state = Get-CurrentPowerState
     
-    # Display matrix - each row is a separate array to prevent PowerShell flattening
-    $header = "  {0,-28} {1,-9} {2,-6} {3,-10} {4,-6} {5,-4}" -f "Setting", "Current", "Low+", "Balanced", "High", "MAX"
+    # Display matrix
+    $header = "  {0,-30} {1,-9} {2,-8} {3,-8} {4,-6}" -f "Setting", "Current", "Reachable", "Always", "MAX"
     Write-Host $header -ForegroundColor White
-    Write-Host "  $('-' * 67)"
+    Write-Host "  $('-' * 63)"
     
-    # Helper function to print one row (avoids array flattening)
+    # Helper function to print one row
     function Write-PowerRow {
-        param([string]$Name, [bool]$Value, [bool]$InLow, [bool]$InBal, [bool]$InHigh, [bool]$InMax)
+        param([string]$Name, [bool]$Value, [bool]$InReach, [bool]$InAlways, [bool]$InMax)
         $current = if ($Value) { "YES" } else { "no" }
         $currentColor = if ($Value) { "Green" } else { "Red" }
-        $c1 = if ($InLow)  { "X" } else { "-" }
-        $c2 = if ($InBal)  { "X" } else { "-" }
-        $c3 = if ($InHigh) { "X" } else { "-" }
-        $c4 = if ($InMax)  { "X" } else { "-" }
-        Write-Host ("  {0,-28} " -f $Name) -NoNewline
+        $c1 = if ($InReach)  { "X" } else { "-" }
+        $c2 = if ($InAlways) { "X" } else { "-" }
+        $c3 = if ($InMax)    { "X" } else { "-" }
+        Write-Host ("  {0,-30} " -f $Name) -NoNewline
         Write-Host ("{0,-9}" -f $current) -ForegroundColor $currentColor -NoNewline
-        Write-Host (" {0,-6} {1,-10} {2,-6} {3,-4}" -f $c1, $c2, $c3, $c4)
+        Write-Host (" {0,-8} {1,-8} {2,-6}" -f $c1, $c2, $c3)
     }
     
-    Write-PowerRow "NIC power saving off"        ([bool]$state.NICPowerOff)    $true  $true  $true  $true
-    Write-PowerRow "Network alive in standby"    ([bool]$state.NetworkStandby) $true  $true  $true  $true
-    Write-PowerRow "Sleep disabled (AC)"         ([bool]$state.SleepAC)        $false $true  $true  $true
-    Write-PowerRow "Sleep disabled (battery)"    ([bool]$state.SleepDC)        $false $false $true  $true
-    Write-PowerRow "Lid close = nothing (AC)"    ([bool]$state.LidAC)          $false $true  $true  $true
-    Write-PowerRow "Lid close = nothing (bat)"   ([bool]$state.LidDC)          $false $false $true  $true
-    Write-PowerRow "Hibernate disabled"          ([bool]$state.HibernateOff)   $false $true  $true  $true
-    Write-PowerRow "Shutdown button hidden"      ([bool]$state.ShutdownHidden) $false $false $false $true
+    Write-PowerRow "NIC power saving off"          ([bool]$state.NICPowerOff)    $true  $true  $true
+    Write-PowerRow "Network alive in standby"      ([bool]$state.NetworkStandby) $true  $true  $true
+    Write-PowerRow "Sleep disabled (AC)"           ([bool]$state.SleepAC)        $true  $true  $true
+    Write-PowerRow "Lid close = nothing (AC)"      ([bool]$state.LidAC)          $true  $true  $true
+    Write-PowerRow "Hibernate disabled"            ([bool]$state.HibernateOff)   $true  $true  $true
+    Write-PowerRow "Sleep disabled (battery)"      ([bool]$state.SleepDC)        $false $true  $true
+    Write-PowerRow "Lid close = nothing (battery)" ([bool]$state.LidDC)          $false $true  $true
+    Write-PowerRow "Shutdown button hidden"        ([bool]$state.ShutdownHidden) $false $false $true
     
-    Write-Host "  $('-' * 67)"
+    Write-Host "  $('-' * 63)"
     Write-Host ""
     Write-Host '  X = included in preset   "-" = not changed by preset' -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  RISKS:" -ForegroundColor Yellow
-    Write-Host "    Low+     : Minimal. Only keeps network alive."
-    Write-Host "    Balanced : Battery drains faster on AC (no sleep). Normal on battery."
-    Write-Host "    High     : Battery will drain to zero if unplugged and forgotten."
-    Write-Host "    MAX      : Same as High + shutdown button hidden (HKCU, this user only)."
+    Write-Host "  PRESETS:" -ForegroundColor White
     Write-Host ""
-    Write-Host "  Choose a preset:" -ForegroundColor White
+    Write-Host "  [1] Reachable    - Always reachable when charging (RECOMMENDED)" -ForegroundColor Green
+    Write-Host "                     Sleeps normally on battery. Always on when plugged in."
+    Write-Host "                     This is what you want for a laptop left in a charger."
     Write-Host ""
-    Write-Host "  [1] MAX          - Maximum availability (never off, ever)" -ForegroundColor Yellow
-    Write-Host "  [2] High         - Always on, but shutdown button stays" -ForegroundColor Yellow
-    Write-Host "  [3] Balanced     - Always on when plugged in (RECOMMENDED)" -ForegroundColor Yellow
-    Write-Host "  [4] Low+         - Network stays alive, sleep unchanged" -ForegroundColor Yellow
-    Write-Host "  [5] Low (reset)  - Restore Windows defaults" -ForegroundColor Yellow
-    Write-Host "  [Q] Back / Skip" -ForegroundColor Yellow
+    Write-Host "  [2] Always On    - Never sleeps, even on battery" -ForegroundColor Yellow
+    Write-Host "                     WARNING: Battery will drain to zero if unplugged!"
+    Write-Host ""
+    Write-Host "  [3] MAX          - Always On + shutdown button hidden" -ForegroundColor Yellow
+    Write-Host "                     Prevents accidental shutdown. For dedicated RDP machines."
+    Write-Host ""
+    Write-Host "  [4] Reset        - Restore Windows defaults" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  [Q] Back / Skip" -ForegroundColor DarkGray
     Write-Host ""
     
-    $choice = Read-Host "  Choose [1-5, Q]"
+    $choice = Read-Host "  Choose [1-4, Q]"
     
     switch ($choice) {
-        "1" { Apply-PowerPreset "MAX" }
-        "2" { Apply-PowerPreset "High" }
-        "3" { Apply-PowerPreset "Balanced" }
-        "4" { Apply-PowerPreset "Low+" }
-        "5" { Invoke-PowerReset }
+        "1" { Apply-PowerPreset "Reachable" }
+        "2" { Apply-PowerPreset "AlwaysOn" }
+        "3" { Apply-PowerPreset "MAX" }
+        "4" { Invoke-PowerReset }
         default { return }
     }
 }
@@ -938,46 +975,65 @@ function Apply-PowerPreset {
     Write-Host ""
     Write-Host "  Applying preset: $Preset..." -ForegroundColor Cyan
     
-    # Low+ and above: NIC power saving off + network in standby
-    if ($Preset -in @("Low+", "Balanced", "High", "MAX")) {
-        # Disable NIC power management
-        $nics = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" }
-        foreach ($nic in $nics) {
-            Disable-NetAdapterPowerManagement -Name $nic.Name -ErrorAction SilentlyContinue
-        }
-        # Enable connectivity in standby
-        powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONNECTIVITYINSTANDBY 1 2>$null
-        powercfg /setdcvalueindex SCHEME_CURRENT SUB_NONE CONNECTIVITYINSTANDBY 1 2>$null
-        Write-Host "    [OK] Network stays alive in standby" -ForegroundColor Green
+    # Get active scheme GUID for reliable powercfg commands
+    $schemeGuid = Get-ActiveSchemeGuid
+    if (-not $schemeGuid) {
+        Write-Host "  [X] Could not determine active power scheme." -ForegroundColor Red
+        Read-Host "  Press Enter to continue"
+        return
     }
     
-    # Balanced and above: sleep off (AC), lid nothing (AC), hibernate off
-    if ($Preset -in @("Balanced", "High", "MAX")) {
-        powercfg /change standby-timeout-ac 0
-        powercfg /change hibernate-timeout-ac 0
-        powercfg /x -hibernate-timeout-ac 0
+    # ALL presets: NIC power saving off + network in standby + sleep off (AC) + lid nothing (AC) + hibernate off
+    if ($Preset -in @("Reachable", "AlwaysOn", "MAX")) {
+        # Disable NIC power management (prevents NIC from sleeping)
+        $nics = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" }
+        foreach ($nic in $nics) {
+            # Disable via PowerShell cmdlet
+            Disable-NetAdapterPowerManagement -Name $nic.Name -ErrorAction SilentlyContinue
+            # Also disable via device properties (belt and suspenders)
+            $nicObj = Get-NetAdapterPowerManagement -Name $nic.Name -ErrorAction SilentlyContinue
+            if ($nicObj) {
+                $nicObj.AllowComputerToTurnOffDevice = 'Disabled'
+                $nicObj | Set-NetAdapterPowerManagement -ErrorAction SilentlyContinue
+            }
+        }
+        Write-Host "    [OK] NIC power saving disabled" -ForegroundColor Green
         
-        # Lid action: do nothing on AC
-        powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
+        # Enable connectivity in standby (keeps WiFi/Ethernet alive during Modern Standby)
+        powercfg /setacvalueindex $schemeGuid SUB_NONE CONNECTIVITYINSTANDBY 1 2>$null
+        powercfg /setdcvalueindex $schemeGuid SUB_NONE CONNECTIVITYINSTANDBY 1 2>$null
+        Write-Host "    [OK] Network alive in standby" -ForegroundColor Green
+        
+        # Disable sleep on AC (0 = never)
+        powercfg /setacvalueindex $schemeGuid SUB_SLEEP STANDBYIDLE 0 2>$null
+        powercfg /change standby-timeout-ac 0
+        Write-Host "    [OK] Sleep disabled (AC)" -ForegroundColor Green
+        
+        # Lid close = do nothing on AC (0 = do nothing)
+        powercfg /setacvalueindex $schemeGuid SUB_BUTTONS LIDACTION 0 2>$null
+        Write-Host "    [OK] Lid close = do nothing (AC)" -ForegroundColor Green
         
         # Disable hibernate
         powercfg /hibernate off 2>$null
-        
-        Write-Host "    [OK] Sleep/hibernate disabled (AC)" -ForegroundColor Green
-        Write-Host "    [OK] Lid close = do nothing (AC)" -ForegroundColor Green
+        Write-Host "    [OK] Hibernate disabled" -ForegroundColor Green
     }
     
-    # Balanced: keep battery defaults
-    if ($Preset -eq "Balanced") {
+    # Reachable: keep battery defaults (sleep on battery, lid = sleep on battery)
+    if ($Preset -eq "Reachable") {
+        powercfg /setdcvalueindex $schemeGuid SUB_SLEEP STANDBYIDLE 900 2>$null
         powercfg /change standby-timeout-dc 15
-        powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 1 2>$null
+        powercfg /setdcvalueindex $schemeGuid SUB_BUTTONS LIDACTION 1 2>$null
         Write-Host "    [OK] Battery: normal sleep (15 min), lid = sleep" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "    Summary: Always reachable when charger is plugged in." -ForegroundColor White
+        Write-Host "    On battery: sleeps after 15 min, lid close = sleep." -ForegroundColor White
     }
     
-    # High and above: also disable sleep on battery, lid nothing on battery
-    if ($Preset -in @("High", "MAX")) {
+    # AlwaysOn and MAX: also disable sleep on battery, lid nothing on battery
+    if ($Preset -in @("AlwaysOn", "MAX")) {
+        powercfg /setdcvalueindex $schemeGuid SUB_SLEEP STANDBYIDLE 0 2>$null
         powercfg /change standby-timeout-dc 0
-        powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
+        powercfg /setdcvalueindex $schemeGuid SUB_BUTTONS LIDACTION 0 2>$null
         Write-Host "    [OK] Sleep disabled (battery too)" -ForegroundColor Green
         Write-Host "    [OK] Lid close = do nothing (battery too)" -ForegroundColor Green
     }
@@ -990,15 +1046,15 @@ function Apply-PowerPreset {
         Write-Host "    [OK] Shutdown button hidden (this user only)" -ForegroundColor Green
     }
     
-    # Apply active scheme
-    powercfg /setactive SCHEME_CURRENT 2>$null
+    # Apply the scheme to make changes take effect immediately
+    powercfg /setactive $schemeGuid 2>$null
     
     # Save preset marker
     if (-not (Test-Path $MARKER_DIR)) { New-Item -ItemType Directory -Path $MARKER_DIR -Force | Out-Null }
     Set-Content "$MARKER_DIR\power-preset.txt" $Preset
     
     Write-Host ""
-    Write-Host "  [OK] Preset '$Preset' applied." -ForegroundColor Green
+    Write-Host "  [OK] Preset '$Preset' applied successfully." -ForegroundColor Green
     Write-Host ""
     Read-Host "  Press Enter to continue"
 }
@@ -1008,16 +1064,29 @@ function Invoke-PowerReset {
     Write-Host ""
     Write-Host "  Restoring Windows defaults..." -ForegroundColor Cyan
     
-    powercfg /change standby-timeout-ac 30
-    powercfg /change standby-timeout-dc 15
-    powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 1 2>$null
-    powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 1 2>$null
-    powercfg /hibernate on 2>$null
+    $schemeGuid = Get-ActiveSchemeGuid
+    if ($schemeGuid) {
+        powercfg /change standby-timeout-ac 30
+        powercfg /change standby-timeout-dc 15
+        powercfg /setacvalueindex $schemeGuid SUB_SLEEP STANDBYIDLE 1800 2>$null
+        powercfg /setdcvalueindex $schemeGuid SUB_SLEEP STANDBYIDLE 900 2>$null
+        powercfg /setacvalueindex $schemeGuid SUB_BUTTONS LIDACTION 1 2>$null
+        powercfg /setdcvalueindex $schemeGuid SUB_BUTTONS LIDACTION 1 2>$null
+        powercfg /setacvalueindex $schemeGuid SUB_NONE CONNECTIVITYINSTANDBY 0 2>$null
+        powercfg /setdcvalueindex $schemeGuid SUB_NONE CONNECTIVITYINSTANDBY 0 2>$null
+        powercfg /hibernate on 2>$null
+        powercfg /setactive $schemeGuid 2>$null
+    }
     
     # Re-enable NIC power management
     $nics = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" }
     foreach ($nic in $nics) {
         Enable-NetAdapterPowerManagement -Name $nic.Name -ErrorAction SilentlyContinue
+        $nicObj = Get-NetAdapterPowerManagement -Name $nic.Name -ErrorAction SilentlyContinue
+        if ($nicObj) {
+            $nicObj.AllowComputerToTurnOffDevice = 'Enabled'
+            $nicObj | Set-NetAdapterPowerManagement -ErrorAction SilentlyContinue
+        }
     }
     
     # Restore shutdown button
